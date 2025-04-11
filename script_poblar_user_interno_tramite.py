@@ -4,6 +4,7 @@ ya que esto nos servirá para generar endpoints de consultas de rendimientos y m
 """
 import psycopg2
 from psycopg2 import sql
+from datetime import datetime
 import sys
 
 # ========== VARIABLES DE CONEXIÓN Y CONFIGURACIÓN ==========
@@ -96,6 +97,7 @@ def obtener_datos_historico(conn):
 def crear_diccionario_tramites(data_historico, usuarios):
     lista_tramites = []
     user_map = {name: uid for uid, name in usuarios}
+    no_encontrados = set()
 
     for tramite, nombre_responsable in data_historico:
         id_tramitador = user_map.get(nombre_responsable)
@@ -106,8 +108,103 @@ def crear_diccionario_tramites(data_historico, usuarios):
                 'nombre_tramitador': nombre_responsable
             })
         else:
-            print("⚠️ No se encontró usuario para:", nombre_responsable)
-    return lista_tramites
+            if nombre_responsable:
+                print("⚠️ No se encontró usuario para:", nombre_responsable)
+                no_encontrados.add(nombre_responsable)
+            else:
+                print("⚠️ Nombre de responsable es None para trámite:", tramite)
+
+
+    print("\n📌 Usuarios no encontrados (sin duplicados):")
+    for nombre in sorted(filter(None, no_encontrados)):
+        print("-", nombre)
+
+    return lista_tramites, no_encontrados
+
+# Inicializa un diccionario con los usuarios no encontrados
+def inicializar_diccionario_usuarios(no_encontrados):
+    return {nombre: None for nombre in no_encontrados}
+
+# De los usuarios no encontrados buscamos correo en resolución
+def buscar_correos_en_resolucion(conn, usuarios_dict):
+    try:
+        with conn.cursor() as cur:
+            for nombre in usuarios_dict:
+                if usuarios_dict[nombre] is None:
+                    cur.execute("""
+                        SELECT user_res_email 
+                        FROM data.resolucion 
+                        WHERE usuario_int = %s
+                        LIMIT 1
+                    """, (nombre,))
+                    result = cur.fetchone()
+                    if result and result[0]:
+                        usuarios_dict[nombre] = result[0]
+    except Exception as e:
+        print("❌ Error al buscar correos en resolución")
+        print(e)
+# De los usuarios internos no encontrados buscamos su correo en certificado
+def buscar_correos_en_certificado(conn, usuarios_dict):
+    try:
+        with conn.cursor() as cur:
+            for nombre in usuarios_dict:
+                if usuarios_dict[nombre] is None:
+                    cur.execute("""
+                        SELECT user_res_email 
+                        FROM data.certificado 
+                        WHERE usuario_int = %s
+                        LIMIT 1
+                    """, (nombre,))
+                    result = cur.fetchone()
+                    if result and result[0]:
+                        usuarios_dict[nombre] = result[0]
+    except Exception as e:
+        print("❌ Error al buscar correos en certificado")
+        print(e)
+    
+# ESTA FUNCION ES PARA INSERTAR LOS REGISTROS DE USUARIOS INTERNOS FALTANTES INICIALMENTE EN LA DB DE AUTH USER 
+def insertar_usuarios_auth(conn, usuarios_dict):
+    try:
+        with conn.cursor() as cur:
+            for nombre, correo in usuarios_dict.items():
+                nombres = nombre.strip().split()
+                if len(nombres) < 2:
+                    continue  # No se puede construir last_name correctamente
+                first_name = nombres[0]
+                last_name = nombres[1] if len(nombres) == 2 else nombres[2]
+                username = (first_name + '.' + last_name).lower()
+
+                # Correo vacío si no viene
+                correo = correo.strip() if correo else ''
+
+                password = 'pbkdf2_sha256$216000$fakeSalt$fakeHashGeneratedPassword=='  # Contraseña de ejemplo
+                last_login = None
+                is_superuser = False
+                is_staff = False
+                is_active = False
+                date_joined = datetime(2022, 1, 1, 12, 0, 0)
+
+                cur.execute("""
+                    INSERT INTO auth.auth_user (
+                        password, last_login, is_superuser, username, 
+                        first_name, last_name, email, is_staff, 
+                        is_active, date_joined
+                    ) VALUES (
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s
+                    ) ON CONFLICT (username) DO NOTHING
+                """, (
+                    password, last_login, is_superuser, username,
+                    first_name, last_name, correo, is_staff,
+                    is_active, date_joined
+                ))
+        conn.commit()
+        print("✅ Usuarios insertados correctamente en auth_user.")
+    except Exception as e:
+        print("❌ Error al insertar usuarios nuevos en auth_user")
+        print(e)
+        conn.rollback()
 
 # Realizar el UPDATE de los atributos de usuario_tramite y de resposable con los datos extraídos en el paso anterior
 def actualizar_tabla_tramite(conn, lista_tramites):
@@ -117,9 +214,14 @@ def actualizar_tabla_tramite(conn, lista_tramites):
                 query = sql.SQL("""
                     UPDATE {table}
                     SET usuario_tramite = %s,
-                        responsable = %s
+                        responsable_cambio_estado = 
+                            CASE 
+                                WHEN responsable_cambio_estado IS NULL THEN %s 
+                                ELSE responsable_cambio_estado 
+                            END
                     WHERE id = %s
                 """).format(table=sql.Identifier(*TRAMITE_TABLE.split('.')))
+                
                 cur.execute(query, (
                     tramite['id_tramitador'],
                     tramite['nombre_tramitador'],
@@ -135,17 +237,43 @@ def actualizar_tabla_tramite(conn, lista_tramites):
 # ========== FUNCIÓN PRINCIPAL ==========
 
 def main():
+    # 1. Conectar a las bases
     conn_auth = conectar_db(DB_AUTH_CONFIG)
     conn_tramite = conectar_db(DB_TRAMITE_CONFIG)
 
     try:
+        # 1. Conectar a las bases
+        conn_auth = conectar_db(DB_AUTH_CONFIG)
+        conn_tramite = conectar_db(DB_TRAMITE_CONFIG)
+
+        # 2. Obtener usuarios actuales en auth y tramites
         usuarios = obtener_usuarios(conn_auth)
         data_historico = obtener_datos_historico(conn_tramite)
 
-        lista_tramites = crear_diccionario_tramites(data_historico, usuarios)
+        # 3. Crear lista de tramites y lista de usuarios no encontrados
+        lista_tramites, no_encontrados = crear_diccionario_tramites(data_historico, usuarios)
 
         if lista_tramites:
-            actualizar_tabla_tramite(conn_tramite, lista_tramites)
+            if no_encontrados:
+                # 4. Inicializar diccionario de correos
+                usuarios_dict = inicializar_diccionario_usuarios(no_encontrados)
+
+                # 5. Buscar correos en resolucion y certificado
+                buscar_correos_en_resolucion(conn_tramite, usuarios_dict)
+                buscar_correos_en_certificado(conn_tramite, usuarios_dict)
+
+                # 6. Insertar usuarios nuevos en auth_user
+                insertar_usuarios_auth(conn_auth, usuarios_dict)
+
+                # 7. Obtener nuevamente usuarios actualizados
+                usuarios_actualizados = obtener_usuarios(conn_auth)
+
+                # 8. Rehacer asociación ID tramitador y actualizar la tabla tramite
+                lista_tramites_actualizada, _ = crear_diccionario_tramites(data_historico, usuarios_actualizados)
+                actualizar_tabla_tramite(conn_tramite, lista_tramites_actualizada)
+            else:
+                print("⚠️ No hay registros de usuarios internos sin relación.")
+
         else:
             print("⚠️ No hay registros para actualizar.")
     finally:
